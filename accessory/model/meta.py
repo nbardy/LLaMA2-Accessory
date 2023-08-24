@@ -88,6 +88,8 @@ class MetaModel(nn.Module):
         images: list,
         max_gen_len: int,
         temperature: float = 0.8,
+        repetition_penalty: float = 1.0,
+        top_k: int = 0,
         top_p: float = 0.95,
     ) -> list[str]:
         bsz = len(prompts)
@@ -111,7 +113,10 @@ class MetaModel(nn.Module):
         prev_pos = 0
         for cur_pos in range(start_pos, total_len):
             logits = self.llma.forward_inference(tokens[:, prev_pos:cur_pos], prev_pos, images if prev_pos == 0 else None)
-            if temperature > 0:
+            if top_k > 0:
+                probs = torch.softmax(logits / temperature, dim=-1)
+                next_token = self.sample_best(probs, top_p, top_k, repetition_penalty)
+            elif temperature > 0:
                 probs = torch.softmax(logits / temperature, dim=-1)
                 next_token = self.sample_top_p(probs, top_p)
             else:
@@ -194,6 +199,40 @@ class MetaModel(nn.Module):
         next_token = torch.multinomial(probs_sort, num_samples=1)
         next_token = torch.gather(probs_idx, -1, next_token)
         return next_token
+    
+    # adds top_k and repetition penalty
+    def sample_best(probs, p, k, repetition_penalty):
+        # Sort probabilities
+        probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+
+        # Apply top-k filtering
+        top_k_probs, top_k_probs_idx = torch.topk(probs_sort, k, dim=-1)
+        mask_k = probs_sort < top_k_probs[..., -1, None]
+        probs_sort[mask_k] = 0.0
+
+        # Apply top-p filtering
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        mask_p = probs_sum > p
+        probs_sort[mask_p] = 0.0
+
+        # Apply repetition penalty
+        if repetition_penalty != 1.0:
+            for i in range(probs.shape[0]):
+                for previous_token in set(probs_idx[i].tolist()):
+                    if probs_sort[i, previous_token] < 0:
+                        probs_sort[i, previous_token] *= repetition_penalty
+                    else:
+                        probs_sort[i, previous_token] /= repetition_penalty
+
+        # Normalize probabilities after filtering
+        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+
+        # Sample next token
+        next_token = torch.multinomial(probs_sort, num_samples=1)
+        next_token = torch.gather(probs_idx, -1, next_token)
+        
+        return next_token
+
 
 
     def get_image_words(self):
